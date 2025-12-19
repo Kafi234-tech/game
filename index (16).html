@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>AR Hand Shooter</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Arial', sans-serif;
+        }
+
+        /* Video element hidden, we draw specifically on canvas */
+        #input_video {
+            display: none; 
+        }
+
+        /* Canvas covers the whole screen */
+        #output_canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1); /* Mirror effect for selfie camera */
+            z-index: 1;
+        }
+
+        /* UI Overlay (Score, Game Over) - Not mirrored */
+        #ui_layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+            pointer-events: none; /* Let clicks pass through if needed */
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        #score_board {
+            color: #00ffea;
+            font-size: 24px;
+            font-weight: bold;
+            padding: 20px;
+            text-shadow: 2px 2px 4px #000;
+        }
+
+        #game_over_screen {
+            display: none; /* Hidden by default */
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 30px;
+            border-radius: 15px;
+            pointer-events: auto;
+        }
+
+        h1 { color: white; margin: 0 0 10px 0; }
+        p { color: #ccc; }
+        
+        button {
+            background: #ff4757;
+            color: white;
+            border: none;
+            padding: 10px 25px;
+            font-size: 18px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-top: 15px;
+        }
+        button:active { transform: scale(0.95); }
+
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 18px;
+            z-index: 10;
+        }
+    </style>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loading">Camera & AI Loading... Please Allow Permissions.</div>
+
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="ui_layer">
+        <div id="score_board">Score: 0</div>
+        
+        <div id="game_over_screen">
+            <h1>GAME OVER</h1>
+            <p>Final Score: <span id="final_score">0</span></p>
+            <button onclick="restartGame()">Play Again</button>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const scoreElement = document.getElementById('score_board');
+        const loadingElement = document.getElementById('loading');
+        const gameOverScreen = document.getElementById('game_over_screen');
+        const finalScoreSpan = document.getElementById('final_score');
+
+        // Game Variables
+        let score = 0;
+        let gameRunning = true;
+        let targets = []; // Array to store flying discs
+        let fingerX = 0;
+        let fingerY = 0;
+        let lastSpawnTime = 0;
+
+        // Resize canvas to fill screen
+        function resizeCanvas() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // --- Game Logic ---
+
+        class Target {
+            constructor() {
+                this.radius = 30 + Math.random() * 20; // Random size
+                // Spawn from sides
+                if (Math.random() < 0.5) {
+                    this.x = -this.radius;
+                    this.vx = 3 + Math.random() * 3; // Velocity X
+                } else {
+                    this.x = canvasElement.width + this.radius;
+                    this.vx = -(3 + Math.random() * 3);
+                }
+                this.y = Math.random() * (canvasElement.height * 0.8);
+                this.color = `hsl(${Math.random() * 360}, 70%, 50%)`;
+                this.markedForDeletion = false;
+            }
+
+            update() {
+                this.x += this.vx;
+                
+                // Check if out of bounds
+                if ((this.vx > 0 && this.x > canvasElement.width + this.radius) || 
+                    (this.vx < 0 && this.x < -this.radius)) {
+                    this.markedForDeletion = true;
+                    // Penalty for missing? Optional.
+                }
+            }
+
+            draw(ctx) {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fillStyle = this.color;
+                ctx.fill();
+                ctx.strokeStyle = "white";
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                
+                // Inner circle
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius * 0.6, 0, Math.PI * 2);
+                ctx.strokeStyle = "rgba(255,255,255,0.5)";
+                ctx.stroke();
+            }
+        }
+
+        function checkCollision() {
+            // Finger coordinates are normalized (0-1), need to scale, AND X is mirrored
+            // Since we use transform: scaleX(-1) on canvas, we can draw logically.
+            // But for logic, we need to treat coordinates carefully.
+            
+            // NOTE: MediaPipe gives x=0 (left) to x=1 (right).
+            // On a mirrored canvas, drawing at x*width works visually.
+            
+            for (let i = 0; i < targets.length; i++) {
+                let t = targets[i];
+                let dx = t.x - (fingerX * canvasElement.width);
+                let dy = t.y - (fingerY * canvasElement.height);
+                let distance = Math.sqrt(dx*dx + dy*dy);
+
+                if (distance < t.radius) {
+                    // Hit!
+                    score += 10;
+                    scoreElement.innerText = "Score: " + score;
+                    t.markedForDeletion = true;
+                    
+                    // Simple hit effect (flash)
+                    canvasCtx.fillStyle = "rgba(255, 255, 255, 0.5)";
+                    canvasCtx.fillRect(0,0, canvasElement.width, canvasElement.height);
+                }
+            }
+            targets = targets.filter(t => !t.markedForDeletion);
+        }
+
+        function spawnManager(timestamp) {
+            if (!gameRunning) return;
+            if (timestamp - lastSpawnTime > 1500) { // Spawn every 1.5 seconds
+                targets.push(new Target());
+                lastSpawnTime = timestamp;
+            }
+        }
+
+        function restartGame() {
+            score = 0;
+            targets = [];
+            gameRunning = true;
+            scoreElement.innerText = "Score: 0";
+            gameOverScreen.style.display = "none";
+        }
+
+        // --- MediaPipe Setup ---
+
+        function onResults(results) {
+            loadingElement.style.display = 'none';
+
+            // 1. Draw Camera Feed
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            // Draw the video frame to the canvas
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            // 2. Handle Hand Tracking
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // Index Finger Tip is landmark 8
+                const indexTip = landmarks[8];
+                fingerX = indexTip.x;
+                fingerY = indexTip.y;
+
+                // Draw standard skeleton
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 3});
+
+                // Draw "Shooting Cursor" on index finger
+                canvasCtx.beginPath();
+                canvasCtx.arc(fingerX * canvasElement.width, fingerY * canvasElement.height, 15, 0, 2 * Math.PI);
+                canvasCtx.strokeStyle = "#00ffea";
+                canvasCtx.lineWidth = 3;
+                canvasCtx.stroke();
+
+                checkCollision();
+            }
+
+            // 3. Update & Draw Game Objects
+            if (gameRunning) {
+                targets.forEach(t => {
+                    t.update();
+                    t.draw(canvasCtx);
+                });
+                spawnManager(performance.now());
+            }
+
+            canvasCtx.restore();
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 0, // 0 is 'Lite' for better mobile performance
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720,
+            facingMode: "user" // Use front camera
+        });
+
+        camera.start();
+
+    </script>
+</body>
+</html>
